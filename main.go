@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -8,154 +9,171 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
-
 )
 
 var secretKey = []byte("your-secret-key")
 
 type Todo struct {
-	Text string
-	Done bool
+	Text string `json:"text"`
+	Done bool   `json:"done"`
 }
 
 var todos []Todo
-var loggedInUser string
 
 func main() {
 	r := gin.Default()
 
-	r.Static("/static", "./static")
-	r.LoadHTMLGlob("templates/*")
-
+	// Endpoint utama untuk melihat daftar todo
 	r.GET("/", func(c *gin.Context) {
-		c.HTML(http.StatusOK, "index.html", gin.H{
-			"Todos":    todos,
-			"LoggedIn": loggedInUser != "",
-			"Username": loggedInUser,
-			"Role":     getRole(loggedInUser),
+		c.JSON(http.StatusOK, gin.H{
+			"todos": todos,
 		})
 	})
 
-
+	// Menambahkan todo (Hanya bisa jika login)
 	r.POST("/add", authenticateMiddleware, func(c *gin.Context) {
 		text := c.PostForm("todo")
+		username, _ := c.Get("username") // Ambil username dari token
+
+		if text == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Todo cannot be empty"})
+			return
+		}
+
 		todo := Todo{Text: text, Done: false}
 		todos = append(todos, todo)
-		c.Redirect(http.StatusSeeOther, "/")
+
+		c.JSON(http.StatusOK, gin.H{
+			"message":  "Todo added successfully",
+			"added_by": username,
+			"todos":    todos, // Kirim daftar terbaru
+		})
 	})
 
+	// Toggle status todo (Done / Not Done)
 	r.POST("/toggle", authenticateMiddleware, func(c *gin.Context) {
-		index := c.PostForm("index")
-		toggleIndex(index)
-		c.Redirect(http.StatusSeeOther, "/")
+		indexStr := c.PostForm("index")
+		index, err := strconv.Atoi(indexStr)
+		if err != nil || index < 0 || index >= len(todos) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid index"})
+			return
+		}
 
+		todos[index].Done = !todos[index].Done
+		username, _ := c.Get("username")
+
+		c.JSON(http.StatusOK, gin.H{
+			"message":     "Todo status toggled",
+			"todo":        todos[index],
+			"modified_by": username,
+			"todos":       todos,
+		})
 	})
 
+	// Login dan mendapatkan token JWT
 	r.POST("/login", func(c *gin.Context) {
 		username := c.PostForm("username")
 		password := c.PostForm("password")
 
-		//  INFO: Dummy Credential Check
+		if username == "" || password == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Username or password cannot be empty"})
+			return
+		}
+
 		if (username == "employee" && password == "password") || (username == "senior" && password == "password") {
-			tokenString, err := createToken(username)
+			encodedPassword := base64.StdEncoding.EncodeToString([]byte(password))
+			tokenString, err := createToken(username, encodedPassword)
 			if err != nil {
-				c.String(http.StatusInternalServerError, "Failed to create token")
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create token"})
 				return
 			}
 
-			loggedInUser = username
-			fmt.Printf("Token Created: %s\n", tokenString)
-			c.SetCookie("token", tokenString, 3600, "/", "localhost", false, true)
-			c.Redirect(http.StatusSeeOther, "/")
+			c.JSON(http.StatusOK, gin.H{
+				"message":  "Login successful",
+				"token":    tokenString,
+				"username": username,
+				"password": encodedPassword,
+			})
 		} else {
-			c.String(http.StatusUnauthorized, "invalid credentials")
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		}
 	})
 
+	// Logout hanya menghapus token di sisi client (tidak ada session di server)
 	r.GET("/logout", func(c *gin.Context) {
-		loggedInUser = ""
-		c.SetCookie("token", "", -1, "/", "localhost", false, true)
-		c.Redirect(http.StatusSeeOther, "/")
+		c.JSON(http.StatusOK, gin.H{"message": "Logout successful"})
 	})
 
 	r.Run(":8080")
 }
 
-func toggleIndex(index string) {
-	i, _ := strconv.Atoi(index)
-	if i >= 0 && i < len(todos) {
-		todos[i].Done = !todos[i].Done
-	}
-}
-
-func getRole(username string) string {
-	if username == "senior" {
-		return "senior"
-	}
-	return "employee"
-}
-
-func createToken(username string) (string, error) {
-	// ... (Code for creating JWT tokens and adding claims will go here)
+// Membuat token JWT
+func createToken(username, encodedPassword string) (string, error) {
 	claims := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"sub": username,
-		"iss": "todo-app",
-		"aud": getRole(username),
-		"exp": time.Now().Add(time.Hour).Unix(),
-		"iat": time.Now().Unix(),
+		"username": username, // Perbaikan: gunakan username sebagai key utama
+		"name":     encodedPassword,
+		"exp":      time.Now().Add(time.Hour).Unix(),
+		"iat":      time.Now().Unix(),
 	})
 
 	tokenString, err := claims.SignedString(secretKey)
-	if err != nil {
-		return "", err
-	}
-
-	fmt.Printf("Token claims added: %+v\n", claims)
-	return tokenString, nil
+	return tokenString, err
 }
 
+// Memverifikasi token JWT
 func verifyToken(tokenString string) (*jwt.Token, error) {
-	// Parse the token with the secret key
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 		return secretKey, nil
 	})
 
-	// Check for verification errors
-	if err != nil {
-		return nil, err
-	}
-
-	// Check if the token is valid
-	if !token.Valid {
+	if err != nil || !token.Valid {
 		return nil, fmt.Errorf("invalid token")
 	}
 
-	// Return the verified token
 	return token, nil
 }
 
+// Middleware untuk mengecek otorisasi pengguna
 func authenticateMiddleware(c *gin.Context) {
-	// Retrieve the token from the cookie
-	tokenString, err := c.Cookie("token")
-	if err != nil {
-		fmt.Println("Token missing in cookie")
-		c.Redirect(http.StatusSeeOther, "/login")
+	authHeader := c.GetHeader("Authorization")
+	if authHeader == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Missing Authorization header"})
 		c.Abort()
 		return
 	}
 
-	// Verify the token
+	// Ekstrak token setelah "Bearer "
+	var tokenString string
+	fmt.Sscanf(authHeader, "Bearer %s", &tokenString)
+
+	// Verifikasi token JWT
 	token, err := verifyToken(tokenString)
 	if err != nil {
-		fmt.Printf("Token verification failed: %v\\n", err)
-		c.Redirect(http.StatusSeeOther, "/login")
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
 		c.Abort()
 		return
 	}
 
-	// Print information about the verified token
-	fmt.Printf("Token verified successfully. Claims: %+v\\n", token.Claims)
+	// Ambil klaim dari token
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token claims"})
+		c.Abort()
+		return
+	}
 
-	// Continue with the next middleware or route handler
+	// Pastikan klaim "username" tersedia
+	username, usernameExists := claims["username"].(string)
+	if !usernameExists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token structure"})
+		c.Abort()
+		return
+	}
+
+	// Simpan data pengguna di context agar bisa digunakan di endpoint lain
+	c.Set("username", username)
+	c.Set("password", claims["name"])
+
+	// Lanjut ke handler berikutnya
 	c.Next()
 }
